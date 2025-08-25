@@ -1,6 +1,7 @@
 import torch
 from task import input_t, output_t
-
+from triton_kernel import triton_fp8_matmul
+"""
 def custom_kernel(data: input_t) -> output_t:
     """
     Optimized implementation of block-scale fp8 gemm
@@ -65,3 +66,8 @@ def custom_kernel(data: input_t) -> output_t:
     c.copy_(accum)
     
     return c
+"""
+def custom_kernel(data: input_t) -> output_t:
+    a, b, a_scale, b_scale, c = data
+    return triton_fp8_matmul(a, b, a_scale, b_scale, c)
+
