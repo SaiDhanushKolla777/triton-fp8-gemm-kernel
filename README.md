@@ -1,169 +1,217 @@
 
 # Triton FP8 Groupwise GEMM Kernel
 
-
-This repository provides an implementation for the AMD Inference Sprint 2025 challenge: **Efficient Groupwise GEMM in FP8 with block-wise scaling on MI300 GPUs**.  
-It is written to help anyone understand the challenge, the file structure, and how to get started with both correctness and optimization.
-
----
-
-## 📝 What is the Problem?
-
-- **Task:** Multiply two large matrices stored in **FP8** format (`e4m3fnuz`), scale their blocks using provided scaling factors, and store the result in **BF16** format.
-- **Twist:** Scaling isn't per element, but **per block**-so you need to apply each scaling value onto chunks (blocks) of the matrix.
-- **Objective:** Do all this as **fast as possible on a GPU** (especially the AMD MI300), while staying correct and matching the expected results.
+This repository contains an implementation of **blockwise FP8 GEMM with scaling factors**, built for the **AMD Inference Sprint 2025** challenge.  
+The project explores different ways to implement the kernel:
+- A **reference version** (slow, always correct),
+- A **Triton prototype** (good for learning and mid-tier performance),
+- A **HIP template** (intended for the fastest implementation on MI300 GPUs).
 
 ---
 
-## 📦 Files & What They Do
+## 1. Problem Description
 
-| File                | Role/Description                                     |
-|---------------------|-----------------------------------------------------|
-| `README.md`         | **This document.** Explains everything in detail.   |
-| `reference.py`      | Organizers’ official reference code. It’s always correct, but not fast. Use it to check your output. |
-| `submission.py`     | Where you write your optimized (or just correct) solution. This is your main file for submission. |
-| `task.py`           | Data types and shapes for inputs and outputs. Used for automatic validation during testing and benchmarks. |
-| `task.yml`          | Describes test cases, benchmarks, and performance goals. Also used by the competition system. |
-| `template.py`       | Minimal Python template to help you start from scratch. |
-| `template-hip.py`   | Starter template for writing a GPU kernel with HIP (low-level, faster, and more complex). |
+We need to multiply two matrices stored in **FP8** (`float8_e4m3fnuz`) with **blockwise scaling factors**, and accumulate the result in **BF16**.
 
----
+- Input matrices are **column-major**.
+- Output matrix is **row-major**.
+- Scaling is **not per element**:
+  - **`a_scale`**: Each row of `a` has a scale per **128-column block**.
+  - **`b_scale`**: Each `[128 × 128]` block of `b` shares one scale.
 
-## 🖼️ Matrix Shapes & Data Explanation
+The final result is:
 
-### Inputs
-
-- `a`: Shape `[M, K]`, FP8, **column-major** (i.e., Fortran-style, not numpy-style ordering!)
-- `b`: Shape `[N, K]`, FP8, **column-major**
-- `a_scale`: `[M, K//128]`, FP32  
-  Each value in `a_scale[m, k_blk]` applies to a block of 128 consecutive columns for row `m` in `a`.
-- `b_scale`: `[N//128, K//128]`, FP32  
-  Each value applies to a `[128,[128]` chunk of `b`.
-
-### Output
-
-- `c`: Shape `[M, N]`, **BF16**, **row-major** (numpy/C style)
-
----
-
-## 🔄 What Does the Computation Look Like?
-
-1. **Scale the Matrices Blockwise**  
-   Multiply each tile/chunk of the input matrices by its corresponding scaling factor (as described above).
-
-2. **Matrix Multiplication**  
-   Multiply the block-scaled `a` with the transpose of block-scaled `b`.
-
-3. **Store Result**  
-   Write the output into `c` in BF16 (bfloat16) format.
-
----
-
-## 💡 The Solution Structure (How to Approach It)
-
-### Step 1: Understand Block-wise Scaling
-
-- For `a`:  
-  For every row, there’s a scaling factor for every 128 column chunk.  
-  Example: For row 0, `a_scale[0,cales columns 0-127, `a_scale[0,` scales 128-255, etc.
-
-- For `b`:  
-  For every[128][128] tile (block), there’s a single scaling factor.
-
-### Step 2: Expand the Scaling Factors
-
-- Efficiently broadcast (expand) the scaling factors so they match the shapes of `a` and `b` for multiplication.
-
-### Step 3: Convert Data Types
-
-- FP8 isn't directly supported for computation in PyTorch, so you typically convert FP8 → float32/BF16 for math, then back to BF16 for output.
-
-### Step 4: Matrix Multiply (and Optimize)
-
-- Multiply the block-scaled matrices (`a` with `b.T`) using an efficient method (initially `torch.matmul`, then later custom Triton/HIP kernels for speed).
-
-### Step 5: Output Storage
-
-- Store the result in `c` (row-major, BF16).
-
----
-
-## 🧑‍💻 Example Code Workflow
-
-Here’s a logical high-level sketch:
-
-```python
-# Read inputs: a, b, a_scale, b_scale
-# Expand a_scale and b_scale to match the blocks they should scale
-a_scaled = ... # multiply/expand a by a_scale
-b_scaled = ... # multiply/expand b by b_scale
-
-# Matrix multiply with the correct transpose
-result = torch.matmul(a_scaled, b_scaled.T)
-
-# Store as BF16 in c, ensuring row-major
-c[...] = result.to(torch.bfloat16)
 ```
 
-For details, check the provided code files and in particular, `reference.py` and your own `submission.py`.
+c = (a \* a\_scale) @ (b \* b\_scale).T
+
+```
+
+with accumulation in FP32, then cast to BF16.
 
 ---
 
-## 🏃‍♂️ How to Run & Test
+## 2. File Overview
 
-1. **Clone the Repository:**
-   ```bash
-   git clone https://github.com/SaiDhanushKolla777/triton-fp8-gemm-kernel.git
-   cd triton-fp8-gemm-kernel
-   ```
-
-2. **Edit `submission.py`:**
-   Put your block-wise GEMM implementation or optimize further.
-
-3. **Check Correctness:**
-   ```python
-   from reference import check
-   check('submission.py')
-   ```
-   This will run the test harness and compare your outputs vs. the reference.
-
-4. **(Optional) Benchmarking:**
-   The `task.yml` describes the official benchmarks and their shapes. You can manually benchmark using the prescribed test cases and compare your execution time to the “speed of light” numbers.
+| File              | What it does |
+|-------------------|--------------|
+| `reference.py`    | Inefficient baseline. Expands scales, dequantizes, then calls `torch.matmul`. |
+| `submission.py`   | Main entry point. The competition harness calls `custom_kernel` from this file. |
+| `triton_kernel.py`| Our Triton kernel. Applies scaling inside the matmul loop, accumulates in FP32, stores BF16. |
+| `template.py`     | Minimal Python template. Mostly for teaching, not for performance. |
+| `template-hip.py` | HIP C++ template. Intended for the fastest MI300 solution. |
+| `task.py`         | Type definitions for inputs/outputs. |
+| `task.yml`        | Defines test shapes and benchmark configs. |
+| `utils.py`        | Helpers (e.g. compare output with reference). |
+| `eval.py`         | Script that runs tests and benchmarks. |
 
 ---
 
-## 🌟 Performance Tips
+## 3. Input/Output Details
 
-- **Start with correctness:** Use high-level code to make it correct first.
-- **Optimize:** Once correct, use Triton or HIP/CUDA (see templates) for serious speed.
-- **Test early and often:** Always check results against the reference before benchmarking.
+### Input Tensors
+- **`a`**: `[M, K]`, FP8, column-major  
+- **`b`**: `[N, K]`, FP8, column-major  
+- **`a_scale`**: `[M, K//128]`, FP32  
+  - `a_scale[m, blk]` applies to `a[m, blk*128 : (blk+1)*128]`.
+- **`b_scale`**: `[N//128, K//128]`, FP32  
+  - `b_scale[n_blk, k_blk]` applies to the block `b[n_blk*128:(n_blk+1)*128, k_blk*128:(k_blk+1)*128]`.
 
----
-
-## 📖 Additional Notes
-
-- **CRLF/LF warnings** are normal when using Windows and can be ignored for this context.
-- **Column-major vs. row-major:** Double-check data layout especially when moving between PyTorch (row-major by default) and the competition’s expected format.
-
----
-
-## 🙏 Acknowledgements
-
-- Thanks to AMD and the GPUmode organizers for providing the reference implementations, documentation, and a fun real-world challenge.
-- Thanks to the developers of [PyTorch](https://pytorch.org/) and [Triton](https://github.com/openai/triton) for outstanding open-source tools.
+### Output Tensor
+- **`c`**: `[M, N]`, BF16, row-major.  
+  Accumulated in FP32, cast to BF16 on store.
 
 ---
 
-## 📜 License
+## 4. ASCII Diagrams of Scaling
+
+### A (LHS) Scaling — `a_scale`
+Each row has a different scale for every 128-wide block of columns:
+
+```
+
+a (M x K)
+
+Row m →
++---------+---------+---------+----
+\| blk 0   | blk 1   | blk 2   | ...
+\| \*s\[m,0] | \*s\[m,1] | \*s\[m,2] |
++---------+---------+---------+----
+
+a\_scale shape: \[M, K//128]
+
+```
+
+So for row `m`, chunk `[0:128]` gets multiplied by `a_scale[m,0]`,  
+chunk `[128:256]` by `a_scale[m,1]`, and so on.
+
+---
+
+### B (RHS) Scaling — `b_scale`
+Every `[128 × 128]` tile in `b` has its own scale:
+
+```
+
+b (N x K)
+
+K →
+0.......128.......256.......384...
+N
+↓
+0  +---------+---------+---------+----
+\| blk(0,0)| blk(0,1)| blk(0,2)|
+\| \*s\[0,0] | \*s\[0,1] | \*s\[0,2] |
+128+---------+---------+---------+----
+\| blk(1,0)| blk(1,1)| blk(1,2)|
+\| \*s\[1,0] | \*s\[1,1] | \*s\[1,2] |
+256+---------+---------+---------+----
+
+````
+
+Here `b_scale[n_blk, k_blk]` multiplies the entire block  
+`b[n_blk*128:(n_blk+1)*128, k_blk*128:(k_blk+1)*128]`.
+
+---
+
+## 5. How the Computation Works
+
+1. **Scaling**
+   - Apply the correct block scale from `a_scale` and `b_scale` as shown above.
+2. **Matmul**
+   - Multiply `a_scaled @ b_scaled.T` in FP32.
+3. **Result**
+   - Convert result to BF16 and write into `c`.
+
+---
+
+## 6. Running Locally
+
+### Install dependencies
+```bash
+pip install torch triton
+````
+
+> On AMD MI300, install ROCm-enabled PyTorch/Triton.
+
+### Test correctness
+
+```python
+from reference import generate_input, check_implementation
+from submission import custom_kernel
+from task import TestSpec
+
+spec = TestSpec(m=128, n=512, k=7168, seed=42)
+data = generate_input(**spec)
+
+check_implementation(custom_kernel)(data)
+```
+
+### Run benchmarks
+
+```bash
+python eval.py
+```
+
+---
+
+## 7. Development Workflow
+
+* Start with `reference.py` → see how scaling is applied.
+* Explore with `triton_kernel.py` → easier to debug and experiment.
+* For max performance: implement in `template-hip.py`.
+
+---
+
+## 8. Performance Hints
+
+* Block size for K = **128** (always guaranteed).
+* Apply scaling **inline inside the K-loop**, not by expanding.
+* Accumulate in FP32, cast to BF16 once at the end.
+* Optimize memory layout and use shared memory for HIP.
+
+---
+
+## 9. Speed of Light (AMD Baselines)
+
+| M    | N    | K    | Time (µs) |
+| ---- | ---- | ---- | --------- |
+| 1024 | 1536 | 7168 | 8.63      |
+| 1024 | 4608 | 7168 | 25.89     |
+| 6144 | 1536 | 7168 | 51.78     |
+| 6144 | 4608 | 7168 | 155.30    |
+| 1024 | 7168 | 256  | 3.17      |
+| 6144 | 7168 | 256  | 17.27     |
+
+Your kernel’s score = geometric mean of benchmark ratios vs these times.
+
+---
+
+## 10. Example: Using Triton Kernel
+
+```python
+from triton_kernel import triton_fp8_matmul
+from reference import generate_input
+
+data = generate_input(m=256, n=512, k=1024, seed=123)
+a, b, a_scale, b_scale, c = data
+
+out = triton_fp8_matmul(a, b, a_scale, b_scale, c)
+print(out.shape)  # [256, 512]
+```
+
+---
+
+## 11. Credits
+
+* AMD & GPUmode for setting up the challenge.
+* OpenAI Triton for GPU programming in Python.
+* PyTorch team for FP8/BF16 support.
+
+---
+
+## 12. License
 
 MIT License
 
----
-
-**Questions or suggestions? Open an issue or pull request on this repo!**
-
----
-
-This README should walk you or any collaborator through the challenge, the code structure, and how to proceed from start to finish.  
-If you want code examples or walkthroughs for any file, feel free to ask!
+```
 
